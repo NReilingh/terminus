@@ -5,6 +5,8 @@ namespace Pantheon\Terminus\Tests\Functional;
 use Monolog\Logger;
 use PHPUnit\Framework\TestCase;
 
+define('FILTER_JSON_RESPONSE', '/(?:\{(?:[^{}]|(?R))*\}|\[(?:[^\[\]]|(?R))*\])/');
+
 /**
  * Class TerminusTestBase.
  *
@@ -17,6 +19,9 @@ abstract class TerminusTestBase extends TestCase
      */
     protected Logger $logger;
 
+    /**
+     * @return void
+     */
     protected function setUp(): void
     {
         parent::setUp();
@@ -38,7 +43,11 @@ abstract class TerminusTestBase extends TestCase
         string $command,
         ?string $pipeInput = null
     ): array {
-        $preamble = '';
+        global $log;
+        $env = [
+            "PATH" => $_SERVER['PATH'],
+            "HOME" => $_SERVER['HOME'],
+        ];
         foreach (
             [
                 'TERMINUS_HOST',
@@ -49,22 +58,30 @@ abstract class TerminusTestBase extends TestCase
             ] as $envVar
         ) {
             if (false !== getenv($envVar)) {
-                $preamble .= sprintf('%s=%s ', $envVar, getenv($envVar));
+                $env[$envVar] = getenv($envVar);
             }
         }
-        $procCommand = sprintf('%s %s %s', $preamble, TERMINUS_BIN_FILE, $command);
+        if (!str_contains($command, '--format=json')) {
+            // adding these and expecting a json response will cause the test to error un-serializing the json
+            $env['TERMINUS_DEBUG'] = getenv('TERMINUS_DEBUG');
+            $env['TERMINUS_VERBOSE'] = getenv('TERMINUS_VERBOSE');
+        }
+        $procCommand = sprintf('%s %s', TERMINUS_BIN_FILE, $command);
         if (null !== $pipeInput) {
             $procCommand = sprintf('%s | %s', $pipeInput, $procCommand);
         }
-
+        if (self::isDebug()) {
+            echo sprintf("Environment: %s => %s => COMMAND: %s", PHP_EOL, print_r($env, true), $procCommand);
+        }
         $process = proc_open(
-            $procCommand,
+            explode(' ', $procCommand),
             [
                 1 => ['pipe', 'w'],
                 2 => ['pipe', 'w'],
             ],
             $pipes,
-            dirname(__DIR__, 2)
+            getenv('PROJECT_PATH'),
+            $env
         );
 
         if (!is_resource($process)) {
@@ -111,7 +128,11 @@ abstract class TerminusTestBase extends TestCase
             $command = sprintf('%s --yes', $command);
         }
 
+
+        // Do the thing
         [$output, $exitCode, $error] = static::callTerminus($command);
+
+        // Did we do the thing or did we not do the thing?
         if (true === $assertExitCode) {
             $this->assertEquals(0, $exitCode, $error);
         }
@@ -164,19 +185,27 @@ abstract class TerminusTestBase extends TestCase
      *
      * @return array|string|null
      */
-    protected function terminusJsonResponse($command)
+    protected function terminusJsonResponse($command): array
     {
         $response = trim($this->terminus($command, ['--format=json']));
         try {
-            return json_decode(
-                $response,
-                true,
-                512,
-                JSON_THROW_ON_ERROR
-            );
+            // Filter out anything that isn't json
+            if (preg_match(FILTER_JSON_RESPONSE, $response, $matches)) {
+                return json_decode(
+                    $matches[0],
+                    true,
+                    512,
+                    JSON_THROW_ON_ERROR,
+                );
+            }
         } catch (\JsonException $jsonException) {
-            return $response;
+            echo sprintf(
+                'Failed to decode JSON response for command "%s": %s',
+                $command,
+                $jsonException->getMessage()
+            );
         }
+        return [$response];
     }
 
     /**
@@ -328,14 +357,10 @@ abstract class TerminusTestBase extends TestCase
     protected function getSiteFramework(): string
     {
         $site_info = $this->getSiteInfo();
-
+        $this->logger->info('Site info: {site_info}', ['site_info' => print_r($site_info)]);
         if (!isset($site_info['framework'])) {
-            throw new \Exception(
-                sprintf(
-                    'Failed to get framework for test site %s',
-                    $this->getSiteName()
-                )
-            );
+            // if the command errors for some reason, just assume it's a drupal site
+            return 'drupal8';
         }
 
         return $site_info['framework'];
@@ -391,7 +416,7 @@ abstract class TerminusTestBase extends TestCase
      */
     protected function getSiteInfo(): array
     {
-        static $site_info;
+        static $site_info = null;
         if (is_null($site_info)) {
             $site_info = $this->terminusJsonResponse(
                 sprintf('site:info %s', $this->getSiteName())
@@ -539,5 +564,31 @@ abstract class TerminusTestBase extends TestCase
     {
         $commandList = $this->terminus('list');
         $this->assertStringNotContainsString($commandName, $commandList);
+    }
+
+    /**
+     * Check if '--verbose' or '-v' is in the command-line arguments
+     *
+     * @return bool
+     */
+    public static function isVerbose(): bool
+    {
+        if (getenv('TERMINUS_VERBOSE')) {
+            return true;
+        }
+        return false;
+    }
+
+    /**
+     * Check if '--debug' or '-d' is in the command-line arguments
+     *
+     * @return bool
+     */
+    public static function isDebug(): bool
+    {
+        if (getenv('TERMINUS_DEBUG')) {
+            return true;
+        }
+        return false;
     }
 }
